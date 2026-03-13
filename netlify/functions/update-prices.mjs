@@ -1,7 +1,7 @@
 /**
- * Near & Now — Weekly Price Updater
- * Netlify Scheduled Function — runs every Thursday at 8am ET
- * Scrapes Flipp for GTA flyer prices → pushes to Supabase
+ * Near & Now - Weekly Price Updater
+ * Netlify Scheduled Function - runs every Thursday at 8am ET
+ * Scrapes Flipp for GTA flyer prices -> pushes to Supabase
  */
 
 import fetch from 'node-fetch';
@@ -146,7 +146,7 @@ export const handler = async () => {
     sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true }),
   ]);
 
-  // Banner → store IDs map
+  // Banner -> store IDs map
   const bannerStores = {};
   for (const store of dbStores) {
     const banner = store.banner || store.name;
@@ -213,7 +213,7 @@ export const handler = async () => {
   console.log(`Matched: ${stats.matched} | Unmatched: ${stats.unmatched}`);
 
   if (!priceRows.length) {
-    console.warn('No price rows — Flipp may be blocking. Check manually.');
+    console.warn('No price rows - Flipp may be blocking. Check manually.');
     return { statusCode: 200, body: 'No prices scraped' };
   }
 
