@@ -90,6 +90,10 @@ Return this exact format:
 
 If no matching items found, return: {"prices": []}`;
 
+    // Resize image to max 1500px wide using free proxy to avoid 8000px limit
+    const encodedUrl = encodeURIComponent(imageUrl);
+    const resizedUrl = `https://images.weserv.nl/?url=${encodedUrl}&w=1500&output=jpg&q=85`;
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -98,14 +102,14 @@ If no matching items found, return: {"prices": []}`;
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-5',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
         messages: [{
           role: 'user',
           content: [
             {
               type: 'image',
-              source: { type: 'url', url: imageUrl }
+              source: { type: 'url', url: resizedUrl }
             },
             { type: 'text', text: prompt }
           ]
