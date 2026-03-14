@@ -6,8 +6,8 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 const FLYER_SOURCES = {
   'No Frills':   'https://www.flyerca.com/no-frills-flyer-sales/',
-  'Food Basics': 'https://www.flyerca.com/food-basics/',
-  'FreshCo':     'https://www.flyerca.com/freshco/',
+  'Food Basics': 'https://www.flyerca.com/food-basics-flyer/',
+  'FreshCo':     'https://www.flyerca.com/freshco-deals/',
   'Walmart':     'https://www.flyerca.com/walmart-canada/',
   'Metro':       'https://www.flyerca.com/metro/',
 };
@@ -51,9 +51,9 @@ async function getFlyerImageUrls(storeUrl) {
     const r = await fetch(storeUrl, { headers: FETCH_HEADERS });
     if (!r.ok) return [];
     const html = await r.text();
-    const matches = html.match(/https:\/\/www\.flyerca\.com\/wp-content\/uploads\/\d{4}\/\d{2}\/[a-z0-9]+-\d+\.jpg/g);
+    const matches = html.match(/https:\/\/www\.flyerca\.com\/wp-content\/uploads\/\d{4}\/\d{2}\/[a-zA-Z0-9_-]+\.jpg/g);
     if (!matches) return [];
-    return [...new Set(matches)].slice(0, 4);
+    return [...new Set(matches)].slice(0, 8);
   } catch (e) {
     console.error('getFlyerImageUrls error:', e.message);
     return [];
