@@ -231,7 +231,7 @@ export const handler = async () => {
           sale_price: priceData.price,
           sale_valid_from: today,
           sale_valid_until: nextWeek,
-          source: 'flyer_ai',
+          source: 'flyer',
           confidence: 'high',
           is_current: true,
           reported_at: new Date().toISOString(),
