@@ -24,7 +24,9 @@ const BASKET_ITEMS = [
 ];
 
 // --- Supabase helpers ---
-async function sbSelect(table, query = '*', filters = {}) {
+async function sbSelect(table, query, filters) {
+  query = query || '*';
+  filters = filters || {};
   let url = `${SUPABASE_URL}/rest/v1/${table}?select=${query}`;
   for (const [k, v] of Object.entries(filters)) url += `&${k}=eq.${v}`;
   const r = await fetch(url, {
@@ -63,7 +65,6 @@ async function getFlyerImageUrls(storeUrl) {
     const html = await r.text();
     const matches = html.match(/https:\/\/www\.flyerca\.com\/wp-content\/uploads\/\d{4}\/\d{2}\/[a-z0-9]+-\d+\.jpg/g);
     if (!matches) return [];
-    // Return first 4 pages only (enough for prices, keeps cost low)
     return [...new Set(matches)].slice(0, 4);
   } catch (e) {
     console.error('Failed to fetch flyer URLs:', e.message);
@@ -90,9 +91,20 @@ Return this exact format:
 
 If no matching items found, return: {"prices": []}`;
 
-    // Resize image to max 1500px wide using free proxy to avoid 8000px limit
-    const encodedUrl = encodeURIComponent(imageUrl);
-    const resizedUrl = `https://images.weserv.nl/?url=${encodedUrl}&w=1500&output=jpg&q=85`;
+    // Download image and send as base64
+    const imgResponse = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.flyerca.com/',
+      }
+    });
+    if (!imgResponse.ok) {
+      console.error(`Image download failed: ${imgResponse.status}`);
+      return [];
+    }
+    const buffer = await imgResponse.arrayBuffer();
+    const imageData = Buffer.from(buffer).toString('base64');
+    console.log(`    Image size: ${Math.round(buffer.byteLength / 1024)}KB`);
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -109,7 +121,11 @@ If no matching items found, return: {"prices": []}`;
           content: [
             {
               type: 'image',
-              source: { type: 'url', url: resizedUrl }
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: imageData
+              }
             },
             { type: 'text', text: prompt }
           ]
@@ -123,7 +139,7 @@ If no matching items found, return: {"prices": []}`;
     }
 
     const data = await response.json();
-    const text = data.content?.[0]?.text || '{"prices":[]}';
+    const text = data.content && data.content[0] ? data.content[0].text : '{"prices":[]}';
     const clean = text.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(clean);
     return parsed.prices || [];
@@ -138,19 +154,15 @@ export const handler = async () => {
   console.log('Near & Now price updater starting (flyerca.com + AI vision)...');
 
   if (!SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
-    console.error('Missing env vars: SUPABASE_URL, SUPABASE_SECRET_KEY, ANTHROPIC_API_KEY');
+    console.error('Missing env vars');
     return { statusCode: 500, body: 'Missing env vars' };
   }
 
-  // Load DB items and stores
-  const [dbItems, dbStores] = await Promise.all([
-    sbSelect('nn_grocery_items', 'id,name,common_names'),
-    sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true }),
-  ]);
+  const dbItems = await sbSelect('nn_grocery_items', 'id,name,common_names');
+  const dbStores = await sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true });
 
   console.log(`Loaded ${dbItems.length} items, ${dbStores.length} stores from DB`);
 
-  // Build banner -> store IDs map
   const bannerStores = {};
   for (const store of dbStores) {
     const banner = store.banner || store.name;
@@ -165,15 +177,14 @@ export const handler = async () => {
 
   for (const [storeName, storeUrl] of Object.entries(FLYER_SOURCES)) {
     const storeIds = bannerStores[storeName];
-    if (!storeIds?.length) {
+    if (!storeIds || !storeIds.length) {
       console.log(`No DB stores found for ${storeName}, skipping`);
       continue;
     }
 
-    console.log(`\nProcessing ${storeName}...`);
+    console.log(`Processing ${storeName}...`);
     const imageUrls = await getFlyerImageUrls(storeUrl);
     console.log(`  Found ${imageUrls.length} flyer images`);
-
     if (!imageUrls.length) continue;
 
     const allPrices = {};
@@ -186,24 +197,20 @@ export const handler = async () => {
 
       for (const p of prices) {
         const key = p.item.toLowerCase();
-        // Keep lowest price if duplicate
         if (!allPrices[key] || p.price < allPrices[key].price) {
           allPrices[key] = p;
         }
       }
 
-      // Small delay between API calls
       await new Promise(r => setTimeout(r, 500));
     }
 
-    // Match extracted prices to DB items
     for (const [itemKey, priceData] of Object.entries(allPrices)) {
-      // Find matching DB item
       let dbItem = null;
       let bestScore = 0;
 
       for (const item of dbItems) {
-        const names = [item.name, ...(item.common_names || [])].map(n => n.toLowerCase());
+        const names = [item.name].concat(item.common_names || []).map(n => n.toLowerCase());
         for (const name of names) {
           if (name.includes(itemKey) || itemKey.includes(name)) {
             const score = Math.max(name.length, itemKey.length);
@@ -238,14 +245,13 @@ export const handler = async () => {
     console.log(`  ${storeName}: ${Object.keys(allPrices).length} unique prices extracted`);
   }
 
-  console.log(`\nTotal: ${stats.prices} price rows from ${stats.stores} stores, ${stats.images} images`);
+  console.log(`Total: ${stats.prices} price rows from ${stats.stores} stores, ${stats.images} images`);
 
   if (!allPriceRows.length) {
-    console.warn('No prices extracted - check if flyerca.com is accessible');
+    console.warn('No prices extracted');
     return { statusCode: 200, body: 'No prices extracted' };
   }
 
-  // Save to Supabase in batches
   let saved = 0;
   for (let i = 0; i < allPriceRows.length; i += 50) {
     try {
