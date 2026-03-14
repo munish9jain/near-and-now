@@ -1,8 +1,3 @@
-/**
- * Near & Now - Weekly Price Updater
- * Fetches flyer images from flyerca.com, resizes with sharp, Claude AI reads prices, saves to Supabase
- */
-
 import sharp from 'sharp';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -17,7 +12,6 @@ const FLYER_SOURCES = {
   'Metro':       'https://www.flyerca.com/metro/',
 };
 
-// Exact DB item names — Claude AI must return these exact names
 const DB_ITEM_NAMES = [
   'Eggs Large','Milk 2%','Bread White','Butter','Bananas','Chicken Breast',
   'Ground Beef','Potatoes','Onions','Rice','Pasta','Canned Tomatoes',
@@ -33,42 +27,23 @@ const FETCH_HEADERS = {
   'Referer': 'https://www.flyerca.com/',
 };
 
-async function sbSelect(table, query, filters) {
-  query = query || '*';
-  filters = filters || {};
-  let url = `${SUPABASE_URL}/rest/v1/${table}?select=${query}`;
-  for (const [k, v] of Object.entries(filters)) url += `&${k}=eq.${v}`;
-  const r = await fetch(url, {
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-  });
-  return r.json();
-}
-
-async function sbDelete(table, filters) {
-  let url = `${SUPABASE_URL}/rest/v1/${table}?`;
-  url += Object.entries(filters).map(([k,v]) => `${k}=eq.${v}`).join('&');
-  const r = await fetch(url, {
-    method: 'DELETE',
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-  });
-  if (!r.ok) console.warn(`Delete warning: ${await r.text()}`);
-}
-
-async function sbInsert(table, rows) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(rows),
-  });
-  if (!r.ok) {
+async function sbRequest(method, path, body) {
+  const url = `${SUPABASE_URL}/rest/v1/${path}`;
+  const headers = {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  if (method === 'GET') {
+    const r = await fetch(url, { headers });
     const text = await r.text();
-    throw new Error(`Insert failed (${r.status}): ${text}`);
+    if (!r.ok) throw new Error(`GET ${path} failed (${r.status}): ${text}`);
+    return JSON.parse(text);
   }
+  const r = await fetch(url, { method, headers, body: JSON.stringify(body) });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`${method} ${path} failed (${r.status}): ${text}`);
+  return text ? JSON.parse(text) : null;
 }
 
 async function getFlyerImageUrls(storeUrl) {
@@ -94,8 +69,6 @@ async function downloadAndResize(imageUrl) {
       .resize(1200, 3500, { fit: 'inside', withoutEnlargement: false })
       .jpeg({ quality: 82 })
       .toBuffer();
-    const meta = await sharp(resized).metadata();
-    console.log(`    Resized to ${meta.width}x${meta.height}, ${Math.round(resized.length/1024)}KB`);
     return resized.toString('base64');
   } catch (e) {
     console.error('downloadAndResize error:', e.message);
@@ -108,22 +81,14 @@ async function readPricesFromImage(imageUrl, storeName) {
     const base64 = await downloadAndResize(imageUrl);
     if (!base64) return [];
 
-    // Give Claude the EXACT item names to use — no guessing
     const prompt = `You are reading a Canadian grocery flyer page for ${storeName}.
 
-Find prices for these exact grocery items if visible in this flyer page:
+Find prices for these exact grocery items if visible:
 ${DB_ITEM_NAMES.join(', ')}
 
-IMPORTANT RULES:
-- Use ONLY the exact item names listed above
-- Use the flyer/sale price shown
-- Only include items clearly visible with a price on THIS page
-- Return ONLY raw JSON, no markdown, no explanation
-
-Return this exact format:
-{"prices": [{"item": "Eggs Large", "price": 3.97}, {"item": "Milk 2%", "price": 5.47}]}
-
-If no matching items found on this page: {"prices": []}`;
+Use ONLY the exact item names above. Return ONLY raw JSON:
+{"prices": [{"item": "Eggs Large", "price": 3.97}]}
+If nothing found: {"prices": []}`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -145,11 +110,7 @@ If no matching items found on this page: {"prices": []}`;
       })
     });
 
-    if (!response.ok) {
-      console.error('Claude API error:', await response.text());
-      return [];
-    }
-
+    if (!response.ok) { console.error('Claude API error:', await response.text()); return []; }
     const data = await response.json();
     const text = data.content && data.content[0] ? data.content[0].text : '{"prices":[]}';
     const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
@@ -164,113 +125,92 @@ export const handler = async () => {
   console.log('Near & Now price updater starting...');
 
   if (!SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
-    console.error('Missing env vars');
     return { statusCode: 500, body: 'Missing env vars' };
   }
 
-  const [dbItems, dbStores] = await Promise.all([
-    sbSelect('nn_grocery_items', 'id,name'),
-    sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true }),
-  ]);
+  // Load DB data
+  const dbItems  = await sbRequest('GET', 'nn_grocery_items?select=id,name');
+  const dbStores = await sbRequest('GET', 'nn_grocery_stores?select=id,name,banner&is_active=eq.true');
   console.log(`DB: ${dbItems.length} items, ${dbStores.length} stores`);
 
-  // Map exact item name -> DB id
   const itemIdMap = {};
   dbItems.forEach(item => { itemIdMap[item.name] = item.id; });
 
-  // Map banner -> store IDs
   const bannerStores = {};
   dbStores.forEach(store => {
     const banner = store.banner || store.name;
     if (!bannerStores[banner]) bannerStores[banner] = [];
-    bannerStores[banner].push({ id: store.id, name: store.name });
+    bannerStores[banner].push(store.id);
   });
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today    = new Date().toISOString().slice(0, 10);
   const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const allPriceRows = [];
+  const allRows  = [];
   let totalStores = 0;
 
   for (const [bannerName, storeUrl] of Object.entries(FLYER_SOURCES)) {
-    const stores = bannerStores[bannerName];
-    if (!stores || !stores.length) {
-      console.log(`Skipping ${bannerName} - not in DB`);
-      continue;
-    }
+    const storeIds = bannerStores[bannerName];
+    if (!storeIds || !storeIds.length) { console.log(`Skipping ${bannerName}`); continue; }
 
     console.log(`\n--- ${bannerName} ---`);
     const imageUrls = await getFlyerImageUrls(storeUrl);
-    console.log(`Found ${imageUrls.length} flyer images`);
+    console.log(`Found ${imageUrls.length} images`);
     if (!imageUrls.length) continue;
 
     const bestPrices = {};
     for (const imageUrl of imageUrls) {
-      console.log(`  Image: ${imageUrl.split('/').pop()}`);
       const prices = await readPricesFromImage(imageUrl, bannerName);
-      console.log(`  -> ${prices.length} prices found: ${prices.map(p=>p.item).join(', ')}`);
-
+      console.log(`  ${imageUrl.split('/').pop()} -> ${prices.length} prices: ${prices.map(p=>p.item).join(', ')}`);
       for (const p of prices) {
-        // Only accept exact DB item names
-        if (!itemIdMap[p.item]) {
-          console.log(`    Skipping unknown item: ${p.item}`);
-          continue;
-        }
-        const key = p.item;
-        if (!bestPrices[key] || p.price < bestPrices[key].price) {
-          bestPrices[key] = p;
-        }
+        if (!itemIdMap[p.item]) continue;
+        if (!bestPrices[p.item] || p.price < bestPrices[p.item]) bestPrices[p.item] = p.price;
       }
       await new Promise(r => setTimeout(r, 300));
     }
 
-    const matched = Object.keys(bestPrices).length;
-    console.log(`${bannerName}: ${matched} items matched to DB`);
+    console.log(`${bannerName}: ${Object.keys(bestPrices).length} items`);
 
-    for (const [itemName, priceData] of Object.entries(bestPrices)) {
-      const itemId = itemIdMap[itemName];
-      if (!itemId) continue;
-
-      for (const store of stores) {
-        allPriceRows.push({
-          store_id: store.id,
-          item_id: itemId,
-          regular_price: priceData.price,
-          sale_price: priceData.price,
+    for (const [itemName, price] of Object.entries(bestPrices)) {
+      for (const storeId of storeIds) {
+        allRows.push({
+          store_id:        storeId,
+          item_id:         itemIdMap[itemName],
+          regular_price:   price,
+          sale_price:      price,
           sale_valid_from: today,
           sale_valid_until: nextWeek,
-          source: 'flyer',
-          confidence: 'high',
-          is_current: true,
-          reported_at: new Date().toISOString(),
+          source:          'flyer_ai',
+          confidence:      'high',
+          is_current:      true,
+          reported_at:     new Date().toISOString(),
         });
       }
     }
-
     totalStores++;
   }
 
-  console.log(`\nTotal rows to save: ${allPriceRows.length}`);
-  if (!allPriceRows.length) {
-    return { statusCode: 200, body: 'No prices extracted' };
+  console.log(`\nTotal rows to save: ${allRows.length}`);
+  if (!allRows.length) return { statusCode: 200, body: 'No prices extracted' };
+
+  // Try inserting one row first to catch any schema issues
+  console.log('Testing insert with 1 row...');
+  console.log('Sample row:', JSON.stringify(allRows[0]));
+  try {
+    await sbRequest('POST', 'nn_grocery_prices', [allRows[0]]);
+    console.log('Test insert OK');
+  } catch(e) {
+    console.error('TEST INSERT FAILED:', e.message);
+    return { statusCode: 500, body: `Insert test failed: ${e.message}` };
   }
 
-  // Delete old prices then insert fresh
-  const affectedStoreIds = [...new Set(allPriceRows.map(r => r.store_id))];
-  for (const storeId of affectedStoreIds) {
+  // Now insert the rest
+  let saved = 1;
+  for (let i = 1; i < allRows.length; i += 50) {
     try {
-      await sbDelete('nn_grocery_prices', { store_id: storeId, is_current: true });
-    } catch(e) {
-      console.warn(`Delete warning for store ${storeId}:`, e.message);
-    }
-  }
-
-  let saved = 0;
-  for (let i = 0; i < allPriceRows.length; i += 50) {
-    try {
-      await sbInsert('nn_grocery_prices', allPriceRows.slice(i, i + 50));
-      saved += Math.min(50, allPriceRows.length - i);
+      await sbRequest('POST', 'nn_grocery_prices', allRows.slice(i, i + 50));
+      saved += Math.min(50, allRows.length - i);
     } catch (e) {
-      console.error('Save error:', e.message);
+      console.error(`Batch ${i} error:`, e.message);
     }
   }
 
