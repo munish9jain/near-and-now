@@ -1,8 +1,10 @@
 /**
  * Near & Now - Weekly Price Updater
- * Fetches flyer images from flyerca.com -> Claude AI reads prices -> saves to Supabase
+ * Fetches flyer images from flyerca.com, resizes with sharp, Claude AI reads prices, saves to Supabase
  * Runs every Thursday at 8am ET
  */
+
+import sharp from 'sharp';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY;
@@ -22,6 +24,11 @@ const BASKET_ITEMS = [
   'yogurt', 'pasta', 'rice', 'tomatoes', 'potatoes',
   'onions', 'carrots', 'lettuce', 'cereal', 'coffee'
 ];
+
+const FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+  'Referer': 'https://www.flyerca.com/',
+};
 
 // --- Supabase helpers ---
 async function sbSelect(table, query, filters) {
@@ -46,65 +53,63 @@ async function sbUpsert(table, rows) {
     },
     body: JSON.stringify(rows),
   });
-  if (!r.ok) {
-    const text = await r.text();
-    throw new Error(`Upsert failed: ${text}`);
-  }
+  if (!r.ok) throw new Error(`Upsert failed: ${await r.text()}`);
 }
 
-// --- Fetch flyer image URLs from flyerca.com ---
+// --- Get flyer image URLs from flyerca.com ---
 async function getFlyerImageUrls(storeUrl) {
   try {
-    const r = await fetch(storeUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html',
-      }
-    });
+    const r = await fetch(storeUrl, { headers: FETCH_HEADERS });
     if (!r.ok) return [];
     const html = await r.text();
     const matches = html.match(/https:\/\/www\.flyerca\.com\/wp-content\/uploads\/\d{4}\/\d{2}\/[a-z0-9]+-\d+\.jpg/g);
     if (!matches) return [];
     return [...new Set(matches)].slice(0, 4);
   } catch (e) {
-    console.error('Failed to fetch flyer URLs:', e.message);
+    console.error('getFlyerImageUrls error:', e.message);
     return [];
   }
 }
 
-// --- Ask Claude AI to read prices from flyer image ---
+// --- Download image, resize to safe dimensions, return base64 ---
+async function downloadAndResize(imageUrl) {
+  try {
+    const r = await fetch(imageUrl, { headers: FETCH_HEADERS });
+    if (!r.ok) return null;
+    const buffer = Buffer.from(await r.arrayBuffer());
+    // Resize: max 1200px wide, max 3500px tall - well under Claude's 8000px limit
+    const resized = await sharp(buffer)
+      .resize(1200, 3500, { fit: 'inside', withoutEnlargement: false })
+      .jpeg({ quality: 82 })
+      .toBuffer();
+    const meta = await sharp(resized).metadata();
+    console.log(`    Resized to ${meta.width}x${meta.height}, ${Math.round(resized.length/1024)}KB`);
+    return resized.toString('base64');
+  } catch (e) {
+    console.error('downloadAndResize error:', e.message);
+    return null;
+  }
+}
+
+// --- Ask Claude to extract grocery prices from flyer image ---
 async function readPricesFromImage(imageUrl, storeName) {
   try {
-    const prompt = `You are reading a Canadian grocery store flyer image for ${storeName}.
+    const base64 = await downloadAndResize(imageUrl);
+    if (!base64) return [];
 
-Extract prices for these common grocery items if they appear in the flyer:
+    const prompt = `You are reading a Canadian grocery store flyer page for ${storeName}.
+
+Find prices for any of these items if visible:
 ${BASKET_ITEMS.join(', ')}
 
+Return ONLY this JSON format, nothing else:
+{"prices": [{"item": "milk", "price": 4.99, "size": "4L"}]}
+
 Rules:
-- Only extract items that clearly show a price
-- Use the sale/flyer price (not regular price)
-- If an item appears multiple times, use the lowest price
-- Return ONLY valid JSON, no other text
-
-Return this exact format:
-{"prices": [{"item": "milk", "price": 4.99, "size": "4L"}, ...]}
-
-If no matching items found, return: {"prices": []}`;
-
-    // Download image and send as base64
-    const imgResponse = await fetch(imageUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.flyerca.com/',
-      }
-    });
-    if (!imgResponse.ok) {
-      console.error(`Image download failed: ${imgResponse.status}`);
-      return [];
-    }
-    const buffer = await imgResponse.arrayBuffer();
-    const imageData = Buffer.from(buffer).toString('base64');
-    console.log(`    Image size: ${Math.round(buffer.byteLength / 1024)}KB`);
+- Use flyer/sale price only
+- Lowest price if item appears multiple times
+- Skip items without a clear price
+- Return {"prices": []} if nothing found`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -119,14 +124,7 @@ If no matching items found, return: {"prices": []}`;
         messages: [{
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: 'image/jpeg',
-                data: imageData
-              }
-            },
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
             { type: 'text', text: prompt }
           ]
         }]
@@ -140,28 +138,44 @@ If no matching items found, return: {"prices": []}`;
 
     const data = await response.json();
     const text = data.content && data.content[0] ? data.content[0].text : '{"prices":[]}';
-    const clean = text.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
+    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
     return parsed.prices || [];
   } catch (e) {
-    console.error('Vision read error:', e.message);
+    console.error('readPricesFromImage error:', e.message);
     return [];
   }
 }
 
+// --- Match extracted item name to DB item ---
+function matchToDbItem(itemKey, dbItems) {
+  let dbItem = null;
+  let bestScore = 0;
+  for (const item of dbItems) {
+    const names = [item.name].concat(item.common_names || []).map(n => n.toLowerCase());
+    for (const name of names) {
+      if (name.includes(itemKey) || itemKey.includes(name)) {
+        const score = Math.max(name.length, itemKey.length);
+        if (score > bestScore) { bestScore = score; dbItem = item; }
+      }
+    }
+  }
+  return dbItem;
+}
+
 // --- Main handler ---
 export const handler = async () => {
-  console.log('Near & Now price updater starting (flyerca.com + AI vision)...');
+  console.log('Near & Now price updater starting...');
 
   if (!SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
-    console.error('Missing env vars');
+    console.error('Missing env vars: SUPABASE_URL, SUPABASE_SECRET_KEY, ANTHROPIC_API_KEY');
     return { statusCode: 500, body: 'Missing env vars' };
   }
 
-  const dbItems = await sbSelect('nn_grocery_items', 'id,name,common_names');
-  const dbStores = await sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true });
-
-  console.log(`Loaded ${dbItems.length} items, ${dbStores.length} stores from DB`);
+  const [dbItems, dbStores] = await Promise.all([
+    sbSelect('nn_grocery_items', 'id,name,common_names'),
+    sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true }),
+  ]);
+  console.log(`DB: ${dbItems.length} items, ${dbStores.length} stores`);
 
   const bannerStores = {};
   for (const store of dbStores) {
@@ -173,57 +187,38 @@ export const handler = async () => {
   const today = new Date().toISOString().slice(0, 10);
   const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const allPriceRows = [];
-  const stats = { stores: 0, images: 0, prices: 0 };
+  let totalStores = 0;
 
   for (const [storeName, storeUrl] of Object.entries(FLYER_SOURCES)) {
     const storeIds = bannerStores[storeName];
     if (!storeIds || !storeIds.length) {
-      console.log(`No DB stores found for ${storeName}, skipping`);
+      console.log(`Skipping ${storeName} - not in DB`);
       continue;
     }
 
-    console.log(`Processing ${storeName}...`);
+    console.log(`\n--- ${storeName} ---`);
     const imageUrls = await getFlyerImageUrls(storeUrl);
-    console.log(`  Found ${imageUrls.length} flyer images`);
+    console.log(`Found ${imageUrls.length} flyer images`);
     if (!imageUrls.length) continue;
 
-    const allPrices = {};
+    const bestPrices = {};
 
     for (const imageUrl of imageUrls) {
-      stats.images++;
-      console.log(`  Reading image: ${imageUrl.split('/').pop()}`);
+      console.log(`  Image: ${imageUrl.split('/').pop()}`);
       const prices = await readPricesFromImage(imageUrl, storeName);
-      console.log(`  -> Found ${prices.length} prices`);
-
+      console.log(`  -> ${prices.length} prices found`);
       for (const p of prices) {
         const key = p.item.toLowerCase();
-        if (!allPrices[key] || p.price < allPrices[key].price) {
-          allPrices[key] = p;
-        }
+        if (!bestPrices[key] || p.price < bestPrices[key].price) bestPrices[key] = p;
       }
-
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 300));
     }
 
-    for (const [itemKey, priceData] of Object.entries(allPrices)) {
-      let dbItem = null;
-      let bestScore = 0;
-
-      for (const item of dbItems) {
-        const names = [item.name].concat(item.common_names || []).map(n => n.toLowerCase());
-        for (const name of names) {
-          if (name.includes(itemKey) || itemKey.includes(name)) {
-            const score = Math.max(name.length, itemKey.length);
-            if (score > bestScore) {
-              bestScore = score;
-              dbItem = item;
-            }
-          }
-        }
-      }
-
+    let matched = 0;
+    for (const [itemKey, priceData] of Object.entries(bestPrices)) {
+      const dbItem = matchToDbItem(itemKey, dbItems);
       if (!dbItem) continue;
-
+      matched++;
       for (const storeId of storeIds) {
         allPriceRows.push({
           store_id: storeId,
@@ -237,18 +232,14 @@ export const handler = async () => {
           is_current: true,
           reported_at: new Date().toISOString(),
         });
-        stats.prices++;
       }
     }
 
-    stats.stores++;
-    console.log(`  ${storeName}: ${Object.keys(allPrices).length} unique prices extracted`);
+    console.log(`${storeName}: ${Object.keys(bestPrices).length} prices extracted, ${matched} matched to DB`);
+    totalStores++;
   }
 
-  console.log(`Total: ${stats.prices} price rows from ${stats.stores} stores, ${stats.images} images`);
-
   if (!allPriceRows.length) {
-    console.warn('No prices extracted');
     return { statusCode: 200, body: 'No prices extracted' };
   }
 
@@ -258,16 +249,13 @@ export const handler = async () => {
       await sbUpsert('nn_grocery_prices', allPriceRows.slice(i, i + 50));
       saved += Math.min(50, allPriceRows.length - i);
     } catch (e) {
-      console.error('Batch save error:', e.message);
+      console.error('Save error:', e.message);
     }
   }
 
-  const msg = `Done! ${saved} prices saved from ${stats.stores} stores`;
+  const msg = `Done! ${saved} prices saved from ${totalStores} stores`;
   console.log(msg);
   return { statusCode: 200, body: msg };
 };
 
-// Schedule: every Thursday at 8am ET (1pm UTC)
-export const config = {
-  schedule: '0 13 * * 4'
-};
+export const config = { schedule: '0 13 * * 4' };
