@@ -53,7 +53,14 @@ async function getFlyerImageUrls(storeUrl) {
     const html = await r.text();
     const matches = html.match(/https:\/\/www\.flyerca\.com\/wp-content\/uploads\/\d{4}\/\d{2}\/[a-zA-Z0-9_-]+\.jpg/g);
     if (!matches) return [];
-    return [...new Set(matches)].slice(0, 8);
+    // Filter out thumbnails and non-flyer images
+    const filtered = [...new Set(matches)].filter(url => 
+      !url.includes('250x200') && 
+      !url.includes('150x150') && 
+      !url.includes('blog') &&
+      !url.includes('-max-')
+    );
+    return filtered.slice(0, 6);
   } catch (e) {
     console.error('getFlyerImageUrls error:', e.message);
     return [];
@@ -113,7 +120,10 @@ If nothing found: {"prices": []}`;
     if (!response.ok) { console.error('Claude API error:', await response.text()); return []; }
     const data = await response.json();
     const text = data.content && data.content[0] ? data.content[0].text : '{"prices":[]}';
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    // Extract JSON even if Claude adds extra text
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return [];
+    const parsed = JSON.parse(jsonMatch[0]);
     return parsed.prices || [];
   } catch (e) {
     console.error('readPricesFromImage error:', e.message);

@@ -1,5 +1,8 @@
 [build]
   functions = "netlify/functions"
 
+[functions]
+  timeout = 300
+
 [[plugins]]
   package = "@netlify/plugin-functions-install-core"
