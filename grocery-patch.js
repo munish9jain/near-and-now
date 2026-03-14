@@ -1,3 +1,4 @@
+window.addEventListener('load', function() {
 // ════════════════════════════════════════════
 // NEAR & NOW — GROCERY ENHANCEMENTS v2
 // Fixed Basket + Flyer Mode + Store Scorecard
@@ -257,3 +258,4 @@ const _origUseDemoGrocery = useDemoGrocery;
 useDemoGrocery = function() { _origUseDemoGrocery(); setTimeout(injectGroceryButtons,100); };
 const _origLoadGrocery = loadGroceryData;
 loadGroceryData = async function() { await _origLoadGrocery(); setTimeout(injectGroceryButtons,100); };
+});
