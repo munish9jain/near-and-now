@@ -1,7 +1,6 @@
 /**
  * Near & Now - Weekly Price Updater
  * Fetches flyer images from flyerca.com, resizes with sharp, Claude AI reads prices, saves to Supabase
- * Runs every Thursday at 8am ET
  */
 
 import sharp from 'sharp';
@@ -30,7 +29,6 @@ const FETCH_HEADERS = {
   'Referer': 'https://www.flyerca.com/',
 };
 
-// --- Supabase helpers ---
 async function sbSelect(table, query, filters) {
   query = query || '*';
   filters = filters || {};
@@ -42,21 +40,33 @@ async function sbSelect(table, query, filters) {
   return r.json();
 }
 
-async function sbUpsert(table, rows) {
+async function sbDelete(table, filters) {
+  let url = `${SUPABASE_URL}/rest/v1/${table}?`;
+  url += Object.entries(filters).map(([k,v]) => `${k}=eq.${v}`).join('&');
+  const r = await fetch(url, {
+    method: 'DELETE',
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+  });
+  if (!r.ok) console.warn(`Delete warning: ${await r.text()}`);
+}
+
+async function sbInsert(table, rows) {
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
     headers: {
       apikey: SUPABASE_KEY,
       Authorization: `Bearer ${SUPABASE_KEY}`,
       'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates,return=minimal',
+      Prefer: 'return=minimal',
     },
     body: JSON.stringify(rows),
   });
-  if (!r.ok) throw new Error(`Upsert failed: ${await r.text()}`);
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Insert failed (${r.status}): ${text}`);
+  }
 }
 
-// --- Get flyer image URLs from flyerca.com ---
 async function getFlyerImageUrls(storeUrl) {
   try {
     const r = await fetch(storeUrl, { headers: FETCH_HEADERS });
@@ -71,13 +81,11 @@ async function getFlyerImageUrls(storeUrl) {
   }
 }
 
-// --- Download image, resize to safe dimensions, return base64 ---
 async function downloadAndResize(imageUrl) {
   try {
     const r = await fetch(imageUrl, { headers: FETCH_HEADERS });
     if (!r.ok) return null;
     const buffer = Buffer.from(await r.arrayBuffer());
-    // Resize: max 1200px wide, max 3500px tall - well under Claude's 8000px limit
     const resized = await sharp(buffer)
       .resize(1200, 3500, { fit: 'inside', withoutEnlargement: false })
       .jpeg({ quality: 82 })
@@ -91,7 +99,6 @@ async function downloadAndResize(imageUrl) {
   }
 }
 
-// --- Ask Claude to extract grocery prices from flyer image ---
 async function readPricesFromImage(imageUrl, storeName) {
   try {
     const base64 = await downloadAndResize(imageUrl);
@@ -146,7 +153,6 @@ Rules:
   }
 }
 
-// --- Match extracted item name to DB item ---
 function matchToDbItem(itemKey, dbItems) {
   let dbItem = null;
   let bestScore = 0;
@@ -162,12 +168,11 @@ function matchToDbItem(itemKey, dbItems) {
   return dbItem;
 }
 
-// --- Main handler ---
 export const handler = async () => {
   console.log('Near & Now price updater starting...');
 
   if (!SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
-    console.error('Missing env vars: SUPABASE_URL, SUPABASE_SECRET_KEY, ANTHROPIC_API_KEY');
+    console.error('Missing env vars');
     return { statusCode: 500, body: 'Missing env vars' };
   }
 
@@ -202,7 +207,6 @@ export const handler = async () => {
     if (!imageUrls.length) continue;
 
     const bestPrices = {};
-
     for (const imageUrl of imageUrls) {
       console.log(`  Image: ${imageUrl.split('/').pop()}`);
       const prices = await readPricesFromImage(imageUrl, storeName);
@@ -217,7 +221,7 @@ export const handler = async () => {
     let matched = 0;
     for (const [itemKey, priceData] of Object.entries(bestPrices)) {
       const dbItem = matchToDbItem(itemKey, dbItems);
-      if (!dbItem) continue;
+      if (!dbItem) { console.log(`    No DB match for: ${itemKey}`); continue; }
       matched++;
       for (const storeId of storeIds) {
         allPriceRows.push({
@@ -235,19 +239,33 @@ export const handler = async () => {
       }
     }
 
-    console.log(`${storeName}: ${Object.keys(bestPrices).length} prices extracted, ${matched} matched to DB`);
+    console.log(`${storeName}: ${Object.keys(bestPrices).length} extracted, ${matched} matched`);
     totalStores++;
   }
 
+  console.log(`\nTotal rows to save: ${allPriceRows.length}`);
   if (!allPriceRows.length) {
     return { statusCode: 200, body: 'No prices extracted' };
   }
 
+  // Delete existing current prices then insert fresh ones
+  const affectedStoreIds = [...new Set(allPriceRows.map(r => r.store_id))];
+  console.log(`Clearing old prices for ${affectedStoreIds.length} stores...`);
+  for (const storeId of affectedStoreIds) {
+    try {
+      await sbDelete('nn_grocery_prices', { store_id: storeId, is_current: true });
+    } catch(e) {
+      console.warn(`Delete warning for store ${storeId}:`, e.message);
+    }
+  }
+
+  // Insert in batches of 50
   let saved = 0;
   for (let i = 0; i < allPriceRows.length; i += 50) {
     try {
-      await sbUpsert('nn_grocery_prices', allPriceRows.slice(i, i + 50));
+      await sbInsert('nn_grocery_prices', allPriceRows.slice(i, i + 50));
       saved += Math.min(50, allPriceRows.length - i);
+      console.log(`Saved batch ${Math.floor(i/50)+1}: ${saved} rows so far`);
     } catch (e) {
       console.error('Save error:', e.message);
     }
