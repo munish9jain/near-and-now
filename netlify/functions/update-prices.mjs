@@ -17,11 +17,15 @@ const FLYER_SOURCES = {
   'Metro':       'https://www.flyerca.com/metro/',
 };
 
-const BASKET_ITEMS = [
-  'milk', 'bread', 'eggs', 'butter', 'chicken breast',
-  'ground beef', 'bananas', 'apples', 'orange juice', 'cheddar cheese',
-  'yogurt', 'pasta', 'rice', 'tomatoes', 'potatoes',
-  'onions', 'carrots', 'lettuce', 'cereal', 'coffee'
+// Exact DB item names — Claude AI must return these exact names
+const DB_ITEM_NAMES = [
+  'Eggs Large','Milk 2%','Bread White','Butter','Bananas','Chicken Breast',
+  'Ground Beef','Potatoes','Onions','Rice','Pasta','Canned Tomatoes',
+  'Cooking Oil','Cheese Cheddar','Yogurt','Orange Juice','Coffee','Cereal',
+  'Apples','Carrots','Tomatoes','Cucumber','Peanut Butter','Jam',
+  'Canned Beans','Tuna Canned','Frozen Vegetables','Laundry Detergent',
+  'Dish Soap','Toilet Paper','Cream Cheese','Broccoli','Bell Peppers',
+  'Garlic','Lemons','Pork Chops','Bacon','Frozen Pizza','Paper Towels'
 ];
 
 const FETCH_HEADERS = {
@@ -104,19 +108,22 @@ async function readPricesFromImage(imageUrl, storeName) {
     const base64 = await downloadAndResize(imageUrl);
     if (!base64) return [];
 
-    const prompt = `You are reading a Canadian grocery store flyer page for ${storeName}.
+    // Give Claude the EXACT item names to use — no guessing
+    const prompt = `You are reading a Canadian grocery flyer page for ${storeName}.
 
-Find prices for any of these items if visible:
-${BASKET_ITEMS.join(', ')}
+Find prices for these exact grocery items if visible in this flyer page:
+${DB_ITEM_NAMES.join(', ')}
 
-Return ONLY this JSON format, nothing else:
-{"prices": [{"item": "milk", "price": 4.99, "size": "4L"}]}
+IMPORTANT RULES:
+- Use ONLY the exact item names listed above
+- Use the flyer/sale price shown
+- Only include items clearly visible with a price on THIS page
+- Return ONLY raw JSON, no markdown, no explanation
 
-Rules:
-- Use flyer/sale price only
-- Lowest price if item appears multiple times
-- Skip items without a clear price
-- Return {"prices": []} if nothing found`;
+Return this exact format:
+{"prices": [{"item": "Eggs Large", "price": 3.97}, {"item": "Milk 2%", "price": 5.47}]}
+
+If no matching items found on this page: {"prices": []}`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -153,21 +160,6 @@ Rules:
   }
 }
 
-function matchToDbItem(itemKey, dbItems) {
-  let dbItem = null;
-  let bestScore = 0;
-  for (const item of dbItems) {
-    const names = [item.name].concat(item.common_names || []).map(n => n.toLowerCase());
-    for (const name of names) {
-      if (name.includes(itemKey) || itemKey.includes(name)) {
-        const score = Math.max(name.length, itemKey.length);
-        if (score > bestScore) { bestScore = score; dbItem = item; }
-      }
-    }
-  }
-  return dbItem;
-}
-
 export const handler = async () => {
   console.log('Near & Now price updater starting...');
 
@@ -177,31 +169,36 @@ export const handler = async () => {
   }
 
   const [dbItems, dbStores] = await Promise.all([
-    sbSelect('nn_grocery_items', 'id,name,common_names'),
+    sbSelect('nn_grocery_items', 'id,name'),
     sbSelect('nn_grocery_stores', 'id,name,banner,is_active', { is_active: true }),
   ]);
   console.log(`DB: ${dbItems.length} items, ${dbStores.length} stores`);
 
+  // Map exact item name -> DB id
+  const itemIdMap = {};
+  dbItems.forEach(item => { itemIdMap[item.name] = item.id; });
+
+  // Map banner -> store IDs
   const bannerStores = {};
-  for (const store of dbStores) {
+  dbStores.forEach(store => {
     const banner = store.banner || store.name;
     if (!bannerStores[banner]) bannerStores[banner] = [];
-    bannerStores[banner].push(store.id);
-  }
+    bannerStores[banner].push({ id: store.id, name: store.name });
+  });
 
   const today = new Date().toISOString().slice(0, 10);
   const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const allPriceRows = [];
   let totalStores = 0;
 
-  for (const [storeName, storeUrl] of Object.entries(FLYER_SOURCES)) {
-    const storeIds = bannerStores[storeName];
-    if (!storeIds || !storeIds.length) {
-      console.log(`Skipping ${storeName} - not in DB`);
+  for (const [bannerName, storeUrl] of Object.entries(FLYER_SOURCES)) {
+    const stores = bannerStores[bannerName];
+    if (!stores || !stores.length) {
+      console.log(`Skipping ${bannerName} - not in DB`);
       continue;
     }
 
-    console.log(`\n--- ${storeName} ---`);
+    console.log(`\n--- ${bannerName} ---`);
     const imageUrls = await getFlyerImageUrls(storeUrl);
     console.log(`Found ${imageUrls.length} flyer images`);
     if (!imageUrls.length) continue;
@@ -209,29 +206,39 @@ export const handler = async () => {
     const bestPrices = {};
     for (const imageUrl of imageUrls) {
       console.log(`  Image: ${imageUrl.split('/').pop()}`);
-      const prices = await readPricesFromImage(imageUrl, storeName);
-      console.log(`  -> ${prices.length} prices found`);
+      const prices = await readPricesFromImage(imageUrl, bannerName);
+      console.log(`  -> ${prices.length} prices found: ${prices.map(p=>p.item).join(', ')}`);
+
       for (const p of prices) {
-        const key = p.item.toLowerCase();
-        if (!bestPrices[key] || p.price < bestPrices[key].price) bestPrices[key] = p;
+        // Only accept exact DB item names
+        if (!itemIdMap[p.item]) {
+          console.log(`    Skipping unknown item: ${p.item}`);
+          continue;
+        }
+        const key = p.item;
+        if (!bestPrices[key] || p.price < bestPrices[key].price) {
+          bestPrices[key] = p;
+        }
       }
       await new Promise(r => setTimeout(r, 300));
     }
 
-    let matched = 0;
-    for (const [itemKey, priceData] of Object.entries(bestPrices)) {
-      const dbItem = matchToDbItem(itemKey, dbItems);
-      if (!dbItem) { console.log(`    No DB match for: ${itemKey}`); continue; }
-      matched++;
-      for (const storeId of storeIds) {
+    const matched = Object.keys(bestPrices).length;
+    console.log(`${bannerName}: ${matched} items matched to DB`);
+
+    for (const [itemName, priceData] of Object.entries(bestPrices)) {
+      const itemId = itemIdMap[itemName];
+      if (!itemId) continue;
+
+      for (const store of stores) {
         allPriceRows.push({
-          store_id: storeId,
-          item_id: dbItem.id,
+          store_id: store.id,
+          item_id: itemId,
           regular_price: priceData.price,
           sale_price: priceData.price,
           sale_valid_from: today,
           sale_valid_until: nextWeek,
-          source: 'flyer',
+          source: 'flyer_ai',
           confidence: 'high',
           is_current: true,
           reported_at: new Date().toISOString(),
@@ -239,7 +246,6 @@ export const handler = async () => {
       }
     }
 
-    console.log(`${storeName}: ${Object.keys(bestPrices).length} extracted, ${matched} matched`);
     totalStores++;
   }
 
@@ -248,9 +254,8 @@ export const handler = async () => {
     return { statusCode: 200, body: 'No prices extracted' };
   }
 
-  // Delete existing current prices then insert fresh ones
+  // Delete old prices then insert fresh
   const affectedStoreIds = [...new Set(allPriceRows.map(r => r.store_id))];
-  console.log(`Clearing old prices for ${affectedStoreIds.length} stores...`);
   for (const storeId of affectedStoreIds) {
     try {
       await sbDelete('nn_grocery_prices', { store_id: storeId, is_current: true });
@@ -259,13 +264,11 @@ export const handler = async () => {
     }
   }
 
-  // Insert in batches of 50
   let saved = 0;
   for (let i = 0; i < allPriceRows.length; i += 50) {
     try {
       await sbInsert('nn_grocery_prices', allPriceRows.slice(i, i + 50));
       saved += Math.min(50, allPriceRows.length - i);
-      console.log(`Saved batch ${Math.floor(i/50)+1}: ${saved} rows so far`);
     } catch (e) {
       console.error('Save error:', e.message);
     }
