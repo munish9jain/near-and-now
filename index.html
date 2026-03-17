@@ -1913,13 +1913,8 @@ async function loadGroceryData() {
       APP.storePrices[sn][iN] = usesSale ? parseFloat(r.sale_price) : parseFloat(r.regular_price);
     });
 
-    // Fall back to static prices for stores with no live data
-    APP.groceryStores.forEach(store => {
-      const banner = store.banner || store.name;
-      if (!APP.storePrices[store.name] || !Object.keys(APP.storePrices[store.name]).length) {
-        APP.storePrices[store.name] = STATIC_STORE_PRICES[banner] || STATIC_STORE_PRICES[store.name] || {};
-      }
-    });
+ 
+    // Static prices disabled - live flyer prices only
 
     // PM policies from DB
     APP.pmPolicies = {};
